@@ -16,6 +16,6 @@ COPY CreateDB /app/CreateDB
 COPY Transactions/app /app/app
 COPY Transactions/.env /app/.env
 
-EXPOSE 8010
+EXPOSE 8003
 
-CMD ["/bin/sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${TRANSACTIONS_PORT:-8010}"]
+CMD ["/bin/sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${TRANSACTIONS_PORT:-8003}"]
