@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlmodel==0.0.24
+SQLAlchemy==2.0.43
+pydantic==2.11.7
+python-dotenv==1.0.1
+mariadb==1.1.13
