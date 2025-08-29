@@ -2,17 +2,24 @@ from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlmodel import Session, select
 from typing import Optional
 import os, sys
+import httpx
+import logging, json
 from .database import get_session
 
-# Centralized schemas import from CreateDB with repo-root guard for local runs
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_repo_root = os.path.abspath(os.path.join(_current_dir, '..', '..'))
-if _repo_root not in sys.path:
-    sys.path.insert(0, _repo_root)
-from CreateDB.schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut
-from CreateDB.models import UserBalance, LedgerTx
+from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse
+from .models import UserBalance, LedgerTx
 
 app = FastAPI(title="Pupero Transactions Service")
+
+# JSON logger
+logger = logging.getLogger("pupero_transactions")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(_h)
+
+# Base URL for Monero Wallet Manager (through API Manager or direct service)
+_MONERO_BASE = os.getenv("MONERO_SERVICE_URL") or "http://monero:8004"
 
 
 def _ensure_balance(session: Session, user_id: int) -> UserBalance:
@@ -24,6 +31,65 @@ def _ensure_balance(session: Session, user_id: int) -> UserBalance:
         session.commit()
         session.refresh(bal)
     return bal
+
+
+def _fetch_real_xmr(user_id: int) -> float | None:
+    """Fetch user's real XMR by querying MoneroWalletManager via API.
+    Behavior:
+      - Query /addresses?user_id.
+      - If none, auto-provision one via POST /addresses and retry once.
+      - Sum unlocked_balance_xmr across all subaddresses and return.
+      - Return None only on connectivity/errors (so caller can keep existing DB value).
+    """
+    base = _MONERO_BASE.rstrip("/")
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            # 1) Fetch mapped addresses
+            r = client.get(f"{base}/addresses", params={"user_id": user_id})
+            if r.status_code != 200:
+                logger.info(json.dumps({"event": "monero_addresses_failed", "user_id": user_id, "status": r.status_code}))
+                return None
+            addresses = r.json() or []
+            # 2) Auto-provision a subaddress if missing, then retry once
+            if not addresses:
+                label = f"user_{user_id}"
+                try:
+                    cr = client.post(f"{base}/addresses", json={"user_id": user_id, "label": label})
+                    logger.info(json.dumps({"event": "monero_address_create_attempt", "user_id": user_id, "status": cr.status_code}))
+                except Exception as e:
+                    logger.warning(json.dumps({"event": "monero_address_create_error", "user_id": user_id, "error": str(e)}))
+                # retry fetch
+                r2 = client.get(f"{base}/addresses", params={"user_id": user_id})
+                if r2.status_code == 200:
+                    addresses = r2.json() or []
+                else:
+                    logger.info(json.dumps({"event": "monero_addresses_retry_failed", "user_id": user_id, "status": r2.status_code}))
+                    return None
+            # 3) Sum unlocked balances
+            total = 0.0
+            any_found = False
+            for a in addresses:
+                addr = a.get("address")
+                if not addr:
+                    continue
+                rb = client.get(f"{base}/balance/{addr}")
+                if rb.status_code != 200:
+                    logger.info(json.dumps({"event": "monero_balance_fetch_failed", "user_id": user_id, "address": addr, "status": rb.status_code}))
+                    continue
+                data = rb.json() or {}
+                val = data.get("unlocked_balance_xmr")
+                try:
+                    v = float(val)
+                except Exception:
+                    logger.info(json.dumps({"event": "monero_balance_parse_error", "user_id": user_id, "address": addr, "val": val}))
+                    continue
+                total += v
+                any_found = True
+            logger.info(json.dumps({"event": "monero_balance_total", "user_id": user_id, "addresses": len(addresses), "total_unlocked_xmr": total}))
+            return total if any_found else 0.0
+    except Exception as e:
+        logger.warning(json.dumps({"event": "monero_fetch_exception", "user_id": user_id, "error": str(e)}))
+        return None
 
 
 def _to_balance_out(b: UserBalance) -> BalanceOut:
@@ -38,6 +104,13 @@ def healthz():
 @app.get("/balance/{user_id}", response_model=BalanceOut)
 def get_balance(user_id: int, session: Session = Depends(get_session)):
     bal = _ensure_balance(session, user_id)
+    # Try to refresh real_xmr from Monero wallet manager
+    real = _fetch_real_xmr(user_id)
+    if real is not None and abs((bal.real_xmr or 0.0) - real) > 1e-12:
+        bal.real_xmr = real
+        session.add(bal)
+        session.commit()
+        session.refresh(bal)
     return _to_balance_out(bal)
 
 
@@ -114,3 +187,110 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     session.refresh(tx)
     # Return
     return TransferOut(id=tx.id, from_user_id=tx.from_user_id, to_user_id=tx.to_user_id, amount_xmr=tx.amount_xmr, status=tx.status, created_at=tx.created_at)
+
+
+
+@app.get("/balance/{user_id}/refresh", response_model=BalanceOut)
+def refresh_balance(user_id: int, session: Session = Depends(get_session)):
+    """Force refresh of real_xmr from Monero and persist it.
+    If Monero is unreachable, returns existing stored value without changes.
+    """
+    bal = _ensure_balance(session, user_id)
+    real = _fetch_real_xmr(user_id)
+    if real is not None:
+        if abs((bal.real_xmr or 0.0) - real) > 1e-12:
+            bal.real_xmr = real
+            session.add(bal)
+            session.commit()
+            session.refresh(bal)
+        logger.info(json.dumps({"event": "balance_refresh", "user_id": user_id, "real_xmr": real}))
+    else:
+        logger.info(json.dumps({"event": "balance_refresh_no_update", "user_id": user_id}))
+    return _to_balance_out(bal)
+
+
+# --- Withdrawal endpoint ---
+@app.post("/withdraw/{user_id}", response_model=WithdrawResponse)
+def withdraw(user_id: int, payload: WithdrawRequest = Body(...), session: Session = Depends(get_session)):
+    # Validate amount
+    if payload.amount_xmr is None or payload.amount_xmr <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+
+    # Ensure balance row exists and refresh real_xmr
+    bal = _ensure_balance(session, user_id)
+    real = _fetch_real_xmr(user_id)
+    if real is not None and abs((bal.real_xmr or 0.0) - real) > 1e-12:
+        bal.real_xmr = real
+        session.add(bal)
+        session.commit()
+        session.refresh(bal)
+
+    total_available = float(bal.fake_xmr or 0.0) + float(bal.real_xmr or 0.0)
+    amt = float(payload.amount_xmr)
+    if amt - total_available > 1e-12:
+        # Not enough combined funds
+        raise HTTPException(status_code=400, detail="Insufficient total balance (fake + real)")
+
+    # Prepare Monero transfer call
+    base = _MONERO_BASE.rstrip("/")
+    transfer_payload = {"to_address": payload.to_address, "amount_xmr": amt}
+
+    # Try to provide a specific from_address (user subaddress) if available
+    from_addr = None
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            ar = client.get(f"{base}/addresses", params={"user_id": user_id})
+            if ar.status_code == 200:
+                arr = ar.json() or []
+                if arr:
+                    from_addr = arr[0].get("address")
+    except Exception as e:
+        logger.info(json.dumps({"event": "withdraw_addresses_fetch_error", "user_id": user_id, "error": str(e)}))
+
+    if from_addr:
+        transfer_payload["from_address"] = from_addr
+
+    # Call MoneroWalletManager /transfer
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            tr = client.post(f"{base}/transfer", json=transfer_payload)
+            if tr.status_code != 200:
+                # Bubble up error from upstream
+                try:
+                    detail = tr.json().get("detail", tr.text)
+                except Exception:
+                    detail = tr.text
+                raise HTTPException(status_code=502, detail=f"Monero transfer failed: {detail}")
+            monero_res = tr.json() or {}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Monero transfer error: {e}")
+
+    # Deduct locally: consume fake first, then real
+    remaining = amt
+    use_fake = min(float(bal.fake_xmr or 0.0), remaining)
+    bal.fake_xmr = float(bal.fake_xmr or 0.0) - use_fake
+    remaining -= use_fake
+    if remaining > 0:
+        bal.real_xmr = float(bal.real_xmr or 0.0) - remaining
+        remaining = 0.0
+
+    session.add(bal)
+    session.commit()
+    session.refresh(bal)
+
+    txh = monero_res.get("tx_hash") or (monero_res.get("tx_hash_list", [None]) or [None])[0]
+    try:
+        logger.info(json.dumps({
+            "event": "withdraw_success",
+            "user_id": user_id,
+            "to": payload.to_address,
+            "amount_xmr": amt,
+            "tx_hash": txh,
+            "from_address": from_addr
+        }))
+    except Exception:
+        pass
+
+    return WithdrawResponse(to_address=payload.to_address, amount_xmr=amt, tx_hash=txh, monero_result=monero_res)

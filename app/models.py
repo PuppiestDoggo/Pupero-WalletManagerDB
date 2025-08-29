@@ -1,7 +1,21 @@
-# Re-export models from centralized CreateDB, adding repo root to sys.path for local runs
-import os, sys
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_repo_root = os.path.abspath(os.path.join(_current_dir, '..', '..'))
-if _repo_root not in sys.path:
-    sys.path.insert(0, _repo_root)
-from CreateDB.models import UserBalance, LedgerTx  # noqa: F401
+from typing import Optional
+from datetime import datetime
+from sqlmodel import SQLModel, Field
+
+from sqlalchemy.sql import func
+class UserBalance(SQLModel, table=True):
+    __tablename__ = "userbalance"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True)
+    fake_xmr: float = 0.0
+    real_xmr: float = 0.0
+    updated_at: datetime = Field(default_factory=datetime.utcnow, sa_column_kwargs={"server_default": func.current_timestamp(), "onupdate": func.current_timestamp()}, index=True)
+
+class LedgerTx(SQLModel, table=True):
+    __tablename__ = "ledgertx"
+    id: Optional[int] = Field(default=None, primary_key=True)
+    from_user_id: int = Field(index=True)
+    to_user_id: int = Field(index=True)
+    amount_xmr: float
+    status: str = Field(default="completed", index=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow, sa_column_kwargs={"server_default": func.current_timestamp()}, index=True)
