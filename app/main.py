@@ -4,6 +4,9 @@ from typing import Optional
 import os, sys
 import httpx
 import logging, json
+import pika
+import urllib.parse
+from datetime import datetime
 from .database import get_session
 
 from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse
@@ -20,6 +23,31 @@ if not logger.handlers:
 
 # Base URL for Monero Wallet Manager (through API Manager or direct service)
 _MONERO_BASE = os.getenv("MONERO_SERVICE_URL") or "http://monero:8004"
+
+# RabbitMQ configuration
+_RABBIT_URL = os.getenv("RABBITMQ_URL")
+_RABBIT_QUEUE = os.getenv("RABBITMQ_QUEUE", "monero.transactions")
+
+def _publish_withdraw(msg: dict):
+    if not _RABBIT_URL:
+        raise HTTPException(status_code=500, detail="RabbitMQ is not configured (RABBITMQ_URL)")
+    try:
+        params = pika.URLParameters(_RABBIT_URL)
+        connection = pika.BlockingConnection(params)
+        ch = connection.channel()
+        ch.queue_declare(queue=_RABBIT_QUEUE, durable=True)
+        body = json.dumps(msg).encode("utf-8")
+        ch.basic_publish(
+            exchange="",
+            routing_key=_RABBIT_QUEUE,
+            body=body,
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        connection.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to enqueue withdraw: {e}")
 
 
 def _ensure_balance(session: Session, user_id: int) -> UserBalance:
@@ -235,62 +263,69 @@ def withdraw(user_id: int, payload: WithdrawRequest = Body(...), session: Sessio
     base = _MONERO_BASE.rstrip("/")
     transfer_payload = {"to_address": payload.to_address, "amount_xmr": amt}
 
-    # Try to provide a specific from_address (user subaddress) if available
+    # Try to provide a specific from_address (user subaddress) with sufficient funds
     from_addr = None
+    chosen_unlocked = 0.0
     try:
-        with httpx.Client(timeout=15.0) as client:
+        with httpx.Client(timeout=20.0) as client:
             ar = client.get(f"{base}/addresses", params={"user_id": user_id})
             if ar.status_code == 200:
-                arr = ar.json() or []
-                if arr:
-                    from_addr = arr[0].get("address")
+                addr_rows = ar.json() or []
+                # Inspect balances: prefer one that covers amount; otherwise take the highest unlocked
+                cover_addr = None
+                cover_unlocked = 0.0
+                best_addr = None
+                best_unlocked = 0.0
+                for row in addr_rows:
+                    addr = row.get("address")
+                    if not addr:
+                        continue
+                    rb = client.get(f"{base}/balance/{addr}")
+                    if rb.status_code != 200:
+                        logger.info(json.dumps({"event": "withdraw_balance_fetch_failed", "user_id": user_id, "address": addr, "status": rb.status_code}))
+                        continue
+                    data = rb.json() or {}
+                    try:
+                        unlocked = float(data.get("unlocked_balance_xmr", 0.0))
+                    except Exception:
+                        unlocked = 0.0
+                    # Track best overall
+                    if unlocked > best_unlocked:
+                        best_unlocked = unlocked
+                        best_addr = addr
+                    # Track best that covers the amount
+                    if unlocked >= amt and unlocked > cover_unlocked:
+                        cover_unlocked = unlocked
+                        cover_addr = addr
+                from_addr = cover_addr or best_addr
+                chosen_unlocked = cover_unlocked if cover_addr else best_unlocked
+                logger.info(json.dumps({"event": "withdraw_source_selected", "user_id": user_id, "from_address": from_addr, "unlocked_xmr": chosen_unlocked}))
     except Exception as e:
         logger.info(json.dumps({"event": "withdraw_addresses_fetch_error", "user_id": user_id, "error": str(e)}))
 
     if from_addr:
         transfer_payload["from_address"] = from_addr
 
-    # Call MoneroWalletManager /transfer
-    try:
-        with httpx.Client(timeout=60.0) as client:
-            tr = client.post(f"{base}/transfer", json=transfer_payload)
-            if tr.status_code != 200:
-                # Bubble up error from upstream
-                try:
-                    detail = tr.json().get("detail", tr.text)
-                except Exception:
-                    detail = tr.text
-                raise HTTPException(status_code=502, detail=f"Monero transfer failed: {detail}")
-            monero_res = tr.json() or {}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Monero transfer error: {e}")
-
-    # Deduct locally: consume fake first, then real
-    remaining = amt
-    use_fake = min(float(bal.fake_xmr or 0.0), remaining)
-    bal.fake_xmr = float(bal.fake_xmr or 0.0) - use_fake
-    remaining -= use_fake
-    if remaining > 0:
-        bal.real_xmr = float(bal.real_xmr or 0.0) - remaining
-        remaining = 0.0
-
-    session.add(bal)
-    session.commit()
-    session.refresh(bal)
-
-    txh = monero_res.get("tx_hash") or (monero_res.get("tx_hash_list", [None]) or [None])[0]
+    # Enqueue withdrawal request to RabbitMQ
+    message = {
+        "type": "withdraw",
+        "user_id": user_id,
+        "to_address": payload.to_address,
+        "amount_xmr": amt,
+        "from_address": from_addr,
+        "requested_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _publish_withdraw(message)
     try:
         logger.info(json.dumps({
-            "event": "withdraw_success",
+            "event": "withdraw_enqueued",
             "user_id": user_id,
             "to": payload.to_address,
             "amount_xmr": amt,
-            "tx_hash": txh,
             "from_address": from_addr
         }))
     except Exception:
         pass
 
-    return WithdrawResponse(to_address=payload.to_address, amount_xmr=amt, tx_hash=txh, monero_result=monero_res)
+    # Return queued status without immediate on-chain execution
+    return WithdrawResponse(to_address=payload.to_address, amount_xmr=amt, tx_hash=None, monero_result=None)
