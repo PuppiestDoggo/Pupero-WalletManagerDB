@@ -22,7 +22,22 @@ if not logger.handlers:
     logger.addHandler(_h)
 
 # Base URL for Monero Wallet Manager (through API Manager or direct service)
-_MONERO_BASE = os.getenv("MONERO_SERVICE_URL") or "http://monero:8004"
+
+def _normalize_monero_base(val: str | None) -> str:
+    default = "http://monero:8004"
+    if not val:
+        return default
+    v = val.strip().rstrip("/")
+    if "://" in v:
+        return v
+    name = v
+    if name in {"api-manager", "pupero-api-manager"}:
+        return f"http://{name}:8000/monero"
+    if name in {"monero", "pupero-monero"}:
+        return f"http://{name}:8004"
+    return default
+
+_MONERO_BASE = _normalize_monero_base(os.getenv("MONERO_SERVICE_URL"))
 
 # RabbitMQ configuration
 _RABBIT_URL = os.getenv("RABBITMQ_URL")
