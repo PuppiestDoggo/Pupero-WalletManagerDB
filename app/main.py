@@ -212,7 +212,7 @@ def decrease_balance(user_id: int, payload: BalanceAdjustRequest, session: Sessi
     return _to_balance_out(bal)
 
 
-@app.post("/transactions/transfer", response_model=TransferOut)
+@app.post("/transfer", response_model=TransferOut)
 def create_transfer(payload: TransferCreate = Body(...), session: Session = Depends(get_session)):
     if payload.amount_xmr <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero")
@@ -236,7 +236,7 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     return TransferOut(id=tx.id, from_user_id=tx.from_user_id, to_user_id=tx.to_user_id, amount_xmr=tx.amount_xmr, status=tx.status, created_at=tx.created_at)
 
 # New trading endpoint: enqueue trade to RabbitMQ only (no immediate balance mutation)
-@app.post("/transactions/trade", response_model=TradeQueued)
+@app.post("/trade", response_model=TradeQueued)
 def create_trade(payload: TradeCreate = Body(...)):
     if payload.amount_xmr <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than zero")
