@@ -29,6 +29,22 @@ class TransferOut(BaseModel):
     status: str
     created_at: datetime
 
+# Trade (off-chain ledger) schemas for queued processing
+class TradeCreate(BaseModel):
+    seller_id: int
+    buyer_id: int
+    amount_xmr: float
+    offer_id: Optional[str] = None  # optional context id from Offers service
+
+class TradeQueued(BaseModel):
+    seller_id: int
+    buyer_id: int
+    amount_xmr: float
+    offer_id: Optional[str] = None
+    queued: bool = True
+    enqueued_at: datetime
+    queue: str
+
 # Withdraw (on-chain) schemas
 class WithdrawRequest(BaseModel):
     to_address: str

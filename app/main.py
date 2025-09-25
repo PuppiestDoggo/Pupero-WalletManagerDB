@@ -9,7 +9,7 @@ import urllib.parse
 from datetime import datetime
 from .database import get_session
 
-from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse
+from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse, TradeCreate, TradeQueued
 from .models import UserBalance, LedgerTx
 
 app = FastAPI(title="Pupero Transactions Service")
@@ -33,7 +33,7 @@ def _normalize_monero_base(val: str | None) -> str:
     name = v
     if name in {"api-manager", "pupero-api-manager"}:
         return f"http://{name}:8000/monero"
-    if name in {"monero", "pupero-monero"}:
+    if name in {"monero", "pupero-WalletManager"}:
         return f"http://{name}:8004"
     return default
 
@@ -41,20 +41,21 @@ _MONERO_BASE = _normalize_monero_base(os.getenv("MONERO_SERVICE_URL"))
 
 # RabbitMQ configuration
 _RABBIT_URL = os.getenv("RABBITMQ_URL")
-_RABBIT_QUEUE = os.getenv("RABBITMQ_QUEUE", "monero.transactions")
+_RABBIT_QUEUE = os.getenv("RABBITMQ_QUEUE", "monero.transactions")  # withdrawals default
+_RABBIT_TRADE_QUEUE = os.getenv("RABBITMQ_TRADE_QUEUE", "wallet.trades")
 
-def _publish_withdraw(msg: dict):
+def _publish_queue(msg: dict, queue_name: str):
     if not _RABBIT_URL:
         raise HTTPException(status_code=500, detail="RabbitMQ is not configured (RABBITMQ_URL)")
     try:
         params = pika.URLParameters(_RABBIT_URL)
         connection = pika.BlockingConnection(params)
         ch = connection.channel()
-        ch.queue_declare(queue=_RABBIT_QUEUE, durable=True)
+        ch.queue_declare(queue=queue_name, durable=True)
         body = json.dumps(msg).encode("utf-8")
         ch.basic_publish(
             exchange="",
-            routing_key=_RABBIT_QUEUE,
+            routing_key=queue_name,
             body=body,
             properties=pika.BasicProperties(delivery_mode=2)
         )
@@ -62,7 +63,10 @@ def _publish_withdraw(msg: dict):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to enqueue withdraw: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to enqueue message to {queue_name}: {e}")
+
+def _publish_withdraw(msg: dict):
+    _publish_queue(msg, _RABBIT_QUEUE)
 
 
 def _ensure_balance(session: Session, user_id: int) -> UserBalance:
@@ -218,7 +222,7 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     # Validate
     if from_bal.fake_xmr < payload.amount_xmr:
         raise HTTPException(status_code=400, detail="Insufficient fake balance")
-    # Apply transfer
+    # Apply transfer instantly (local ledger transfer)
     from_bal.fake_xmr -= payload.amount_xmr
     to_bal.fake_xmr += payload.amount_xmr
     session.add(from_bal)
@@ -230,6 +234,30 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     session.refresh(tx)
     # Return
     return TransferOut(id=tx.id, from_user_id=tx.from_user_id, to_user_id=tx.to_user_id, amount_xmr=tx.amount_xmr, status=tx.status, created_at=tx.created_at)
+
+# New trading endpoint: enqueue trade to RabbitMQ only (no immediate balance mutation)
+@app.post("/transactions/trade", response_model=TradeQueued)
+def create_trade(payload: TradeCreate = Body(...)):
+    if payload.amount_xmr <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+    message = {
+        "type": "trade",
+        "seller_id": payload.seller_id,
+        "buyer_id": payload.buyer_id,
+        "amount_xmr": float(payload.amount_xmr),
+        "offer_id": payload.offer_id,
+        "requested_at": datetime.utcnow().isoformat() + "Z",
+    }
+    _publish_queue(message, _RABBIT_TRADE_QUEUE)
+    return TradeQueued(
+        seller_id=payload.seller_id,
+        buyer_id=payload.buyer_id,
+        amount_xmr=float(payload.amount_xmr),
+        offer_id=payload.offer_id,
+        queued=True,
+        enqueued_at=datetime.utcnow(),
+        queue=_RABBIT_TRADE_QUEUE,
+    )
 
 
 
