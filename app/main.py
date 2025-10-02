@@ -9,7 +9,7 @@ import urllib.parse
 from datetime import datetime
 from .database import get_session
 
-from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse, TradeCreate, TradeQueued
+from .schemas import BalanceOut, BalanceSetRequest, BalanceAdjustRequest, TransferCreate, TransferOut, WithdrawRequest, WithdrawResponse, TradeCreate, TradeQueued, ReserveCreate, ReservationOut, ReservationCommitRequest
 from .models import UserBalance, LedgerTx
 
 app = FastAPI(title="Pupero Transactions Service")
@@ -234,6 +234,59 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     session.refresh(tx)
     # Return
     return TransferOut(id=tx.id, from_user_id=tx.from_user_id, to_user_id=tx.to_user_id, amount_xmr=tx.amount_xmr, status=tx.status, created_at=tx.created_at)
+
+# --- Escrow reservation endpoints ---
+@app.post("/reserve", response_model=ReservationOut)
+def create_reservation(payload: ReserveCreate = Body(...), session: Session = Depends(get_session)):
+    if payload.amount_xmr is None or payload.amount_xmr <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero")
+    bal = _ensure_balance(session, payload.seller_id)
+    amt = float(payload.amount_xmr)
+    if (bal.fake_xmr or 0.0) < amt:
+        raise HTTPException(status_code=400, detail="Insufficient fake balance")
+    # Decrease available balance and create a reserved ledger entry to escrow (user_id 0)
+    bal.fake_xmr = float(bal.fake_xmr) - amt
+    session.add(bal)
+    tx = LedgerTx(from_user_id=payload.seller_id, to_user_id=0, amount_xmr=amt, status="reserved")
+    session.add(tx)
+    session.commit()
+    session.refresh(tx)
+    return ReservationOut(id=tx.id, seller_id=payload.seller_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
+
+@app.post("/reserve/{reservation_id}/commit", response_model=ReservationOut)
+def commit_reservation(reservation_id: int, payload: ReservationCommitRequest = Body(...), session: Session = Depends(get_session)):
+    tx = session.get(LedgerTx, reservation_id)
+    if not tx or tx.status != "reserved":
+        raise HTTPException(status_code=404, detail="Reservation not found or not reservable")
+    # Credit buyer's balance
+    to_bal = _ensure_balance(session, payload.to_user_id)
+    amt = float(tx.amount_xmr)
+    to_bal.fake_xmr = float(to_bal.fake_xmr) + amt
+    tx.status = "committed"
+    session.add(to_bal)
+    # Also record a final ledger entry for the actual transfer for auditability
+    final_tx = LedgerTx(from_user_id=tx.from_user_id, to_user_id=payload.to_user_id, amount_xmr=amt, status="completed")
+    session.add(tx)
+    session.add(final_tx)
+    session.commit()
+    session.refresh(tx)
+    return ReservationOut(id=tx.id, seller_id=tx.from_user_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
+
+@app.post("/reserve/{reservation_id}/release", response_model=ReservationOut)
+def release_reservation(reservation_id: int, session: Session = Depends(get_session)):
+    tx = session.get(LedgerTx, reservation_id)
+    if not tx or tx.status != "reserved":
+        raise HTTPException(status_code=404, detail="Reservation not found or not releasable")
+    # Return funds to seller
+    bal = _ensure_balance(session, tx.from_user_id)
+    amt = float(tx.amount_xmr)
+    bal.fake_xmr = float(bal.fake_xmr) + amt
+    tx.status = "released"
+    session.add(bal)
+    session.add(tx)
+    session.commit()
+    session.refresh(tx)
+    return ReservationOut(id=tx.id, seller_id=tx.from_user_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
 
 # New trading endpoint: enqueue trade to RabbitMQ only (no immediate balance mutation)
 @app.post("/trade", response_model=TradeQueued)
