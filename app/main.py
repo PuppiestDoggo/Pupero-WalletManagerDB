@@ -147,6 +147,11 @@ def _to_balance_out(b: UserBalance) -> BalanceOut:
 def healthz():
     return {"status": "ok"}
 
+# Alias for k8s/monitoring expectations
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/balance/{user_id}", response_model=BalanceOut)
 def get_balance(user_id: int, session: Session = Depends(get_session)):
