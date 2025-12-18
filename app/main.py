@@ -90,7 +90,7 @@ def _fetch_real_xmr(user_id: int) -> float | None:
     """
     base = _MONERO_BASE.rstrip("/")
     try:
-        with httpx.Client(timeout=10.0) as client:
+        with httpx.Client(timeout=2.0) as client:
             # 1) Fetch mapped addresses
             r = client.get(f"{base}/addresses", params={"user_id": user_id})
             if r.status_code != 200:
