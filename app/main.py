@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 from typing import Optional
 import os, sys
 import httpx
-import logging, json
+import logging, json, time
 import pika
 import urllib.parse
 from datetime import datetime
@@ -17,9 +17,41 @@ app = FastAPI(title="Pupero Transactions Service")
 # JSON logger
 logger = logging.getLogger("pupero_transactions")
 if not logger.handlers:
-    _h = logging.StreamHandler()
     logger.setLevel(logging.INFO)
-    logger.addHandler(_h)
+    # Stdout handler
+    stdout_handler = logging.StreamHandler()
+    logger.addHandler(stdout_handler)
+    # Optional File handler
+    import os
+    log_file = os.getenv("LOG_FILE")
+    if log_file:
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            from logging import FileHandler
+            file_handler = FileHandler(log_file)
+            logger.addHandler(file_handler)
+        except Exception as e:
+            logger.error(json.dumps({"event": "file_logging_setup_failed", "error": str(e)}))
+
+from fastapi import Request
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = int((time.time() - start_time) * 1000)
+    
+    log_record = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "event": "http_request",
+        "service": "transactions",
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "latency_ms": duration,
+        "client": request.client.host if request.client else None,
+    }
+    logger.info(json.dumps(log_record))
+    return response
 
 # Base URL for Monero Wallet Manager (through API Manager or direct service)
 
@@ -226,6 +258,7 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     to_bal = _ensure_balance(session, payload.to_user_id)
     # Validate
     if from_bal.fake_xmr < payload.amount_xmr:
+        logger.info(json.dumps({"event": "transfer_failed_insufficient_funds", "from_user_id": payload.from_user_id, "amount": payload.amount_xmr}))
         raise HTTPException(status_code=400, detail="Insufficient fake balance")
     # Apply transfer instantly (local ledger transfer)
     from_bal.fake_xmr -= payload.amount_xmr
@@ -237,8 +270,10 @@ def create_transfer(payload: TransferCreate = Body(...), session: Session = Depe
     session.add(tx)
     session.commit()
     session.refresh(tx)
+    logger.info(json.dumps({"event": "transfer_completed", "tx_id": tx.id, "from": tx.from_user_id, "to": tx.to_user_id, "amount": tx.amount_xmr}))
     # Return
     return TransferOut(id=tx.id, from_user_id=tx.from_user_id, to_user_id=tx.to_user_id, amount_xmr=tx.amount_xmr, status=tx.status, created_at=tx.created_at)
+
 
 # --- Escrow reservation endpoints ---
 @app.post("/reserve", response_model=ReservationOut)
@@ -248,6 +283,7 @@ def create_reservation(payload: ReserveCreate = Body(...), session: Session = De
     bal = _ensure_balance(session, payload.seller_id)
     amt = float(payload.amount_xmr)
     if (bal.fake_xmr or 0.0) < amt:
+        logger.info(json.dumps({"event": "reservation_failed_insufficient_funds", "seller_id": payload.seller_id, "amount": amt}))
         raise HTTPException(status_code=400, detail="Insufficient fake balance")
     # Decrease available balance and create a reserved ledger entry to escrow (user_id 0)
     bal.fake_xmr = float(bal.fake_xmr) - amt
@@ -256,12 +292,15 @@ def create_reservation(payload: ReserveCreate = Body(...), session: Session = De
     session.add(tx)
     session.commit()
     session.refresh(tx)
+    logger.info(json.dumps({"event": "reservation_created", "tx_id": tx.id, "seller_id": payload.seller_id, "amount": amt}))
     return ReservationOut(id=tx.id, seller_id=payload.seller_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
+
 
 @app.post("/reserve/{reservation_id}/commit", response_model=ReservationOut)
 def commit_reservation(reservation_id: int, payload: ReservationCommitRequest = Body(...), session: Session = Depends(get_session)):
     tx = session.get(LedgerTx, reservation_id)
     if not tx or tx.status != "reserved":
+        logger.info(json.dumps({"event": "reservation_commit_failed_not_found", "tx_id": reservation_id}))
         raise HTTPException(status_code=404, detail="Reservation not found or not reservable")
     # Credit buyer's balance
     to_bal = _ensure_balance(session, payload.to_user_id)
@@ -275,12 +314,15 @@ def commit_reservation(reservation_id: int, payload: ReservationCommitRequest = 
     session.add(final_tx)
     session.commit()
     session.refresh(tx)
+    logger.info(json.dumps({"event": "reservation_committed", "tx_id": tx.id, "buyer_id": payload.to_user_id, "amount": amt}))
     return ReservationOut(id=tx.id, seller_id=tx.from_user_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
+
 
 @app.post("/reserve/{reservation_id}/release", response_model=ReservationOut)
 def release_reservation(reservation_id: int, session: Session = Depends(get_session)):
     tx = session.get(LedgerTx, reservation_id)
     if not tx or tx.status != "reserved":
+        logger.info(json.dumps({"event": "reservation_release_failed_not_found", "tx_id": reservation_id}))
         raise HTTPException(status_code=404, detail="Reservation not found or not releasable")
     # Return funds to seller
     bal = _ensure_balance(session, tx.from_user_id)
@@ -291,7 +333,9 @@ def release_reservation(reservation_id: int, session: Session = Depends(get_sess
     session.add(tx)
     session.commit()
     session.refresh(tx)
+    logger.info(json.dumps({"event": "reservation_released", "tx_id": tx.id, "seller_id": tx.from_user_id, "amount": amt}))
     return ReservationOut(id=tx.id, seller_id=tx.from_user_id, amount_xmr=amt, status=tx.status, created_at=tx.created_at)
+
 
 # New trading endpoint: enqueue trade to RabbitMQ only (no immediate balance mutation)
 @app.post("/trade", response_model=TradeQueued)
@@ -307,6 +351,7 @@ def create_trade(payload: TradeCreate = Body(...)):
         "requested_at": datetime.utcnow().isoformat() + "Z",
     }
     _publish_queue(message, _RABBIT_TRADE_QUEUE)
+    logger.info(json.dumps({"event": "trade_enqueued", "offer_id": payload.offer_id, "seller_id": payload.seller_id, "buyer_id": payload.buyer_id, "amount": payload.amount_xmr}))
     return TradeQueued(
         seller_id=payload.seller_id,
         buyer_id=payload.buyer_id,
@@ -358,6 +403,7 @@ def withdraw(user_id: int, payload: WithdrawRequest = Body(...), session: Sessio
     amt = float(payload.amount_xmr)
     if amt - total_available > 1e-12:
         # Not enough combined funds
+        logger.info(json.dumps({"event": "withdraw_failed_insufficient_funds", "user_id": user_id, "amount_xmr": amt, "total_available": total_available}))
         raise HTTPException(status_code=400, detail="Insufficient total balance (fake + real)")
 
     # Prepare Monero transfer call
